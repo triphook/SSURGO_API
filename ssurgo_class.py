@@ -1,36 +1,48 @@
 import os
 import csv
-import gdal
 import numpy as np
+import re
+import sys
 
 from collections import defaultdict
 
-
 # @@@ - assert for data format?
+
 class SSURGO(dict):
-    def __init__(self, path):
+    def __init__(self, path, mode="esri"):
         super(SSURGO, self).__init__()
         self.path = path
-        self.states = sorted({d.upper() for d in os.listdir(self.path) if len(d) == 2})
+        self.mode = mode
+
+        if self.mode == "esri":
+            self.folder_format = "gSSURGO_([A-Z]{2}).gdb"
+        elif self.mode == "streamline":
+            self.folder_format = "([A-Z]{2})"
+        else:
+            sys.exit("Invalid mode \"{}\"".format(self.mode))
+
+        self.states = self.fetch_states()
 
     def __getattr__(self, item):
-        if item not in dir(self):
+        item = item.upper()
+        if item not in self.__dict__.keys():
             if item in self.states:
                 return self[item]
             else:
                 print("State \"{}\" not in SSURGO".format(item))
+                input()
         else:
             return getattr(self, item)
 
     def __getitem__(self, state):
         if state not in self.keys():
             state = state.upper()
-            state_path = os.path.join(self.path, state)
+            state_path = self.states.get(state)
             if not os.path.isdir(state_path):
-                print("{} was not found in the specified SSURGO dataset")
+                print("{} was not found in the specified SSURGO dataset".format(state))
                 return
             else:
-                val = State(state, state_path)
+                val = State(state, state_path, self.mode)
         else:
             val = self[state]
         return val
@@ -39,15 +51,26 @@ class SSURGO(dict):
         for s in sorted(self.states):
             yield self[s]
 
+    def fetch_states(self):
+        states = {}
+        for path, subdirs, _ in os.walk(self.path):
+            for subdir in subdirs:
+                match = re.match(self.folder_format, subdir)
+                if match:
+                    states[match.group(1).upper()] = os.path.join(path, subdir)
+        return states
+
     # TBD
     def states_containing(self, map_unit_or_component):
         pass
 
 
 class State:
-    def __init__(self, state, path):
+    def __init__(self, state, path, mode):
         self.name = state
         self.path = path
+        self.mode = mode
+
         self.grid = os.path.join(path, state)
 
         # Variables that are generated upon being called
@@ -60,7 +83,7 @@ class State:
         self._tables = None
 
     def __getattr__(self, item):
-        if item not in dir(self):
+        if item not in self.__dict__:
             if item in self.tables.keys():
                 return self.tables[item]
             else:
@@ -73,6 +96,7 @@ class State:
 
     @property
     def array(self):
+        import gdal
         if not self._array:
             if not self.ds:
                 self.ds = gdal.Open(self.grid)
@@ -114,39 +138,53 @@ class State:
 
     @property
     def tables(self):
-        if not self._tables:
-            self._tables = {}
+
+        def from_gdb():
+            import arcpy
+            old_workspace = arcpy.env.workspace
+            arcpy.env.workspace = self.path
+            for name in arcpy.ListTables():
+                yield name, name
+            else:
+                arcpy.env.workspace = old_workspace
+
+        def from_folder():
             for f in os.listdir(self.path):
                 name, ext = os.path.splitext(f)
                 if ext == ".csv":
-                    path = os.path.join(self.path, f)
-                    self._tables[name] = Table(path, name, self)
+                    yield name, f
+
+        if not self._tables:
+            self._tables = {}
+            if self.mode == "esri":
+                source = from_gdb()
+            elif self.mode == "streamline":
+                source = from_folder()
+            for name, f in source:
+                self._tables[name] = Table(os.path.join(self.path, f), name, self.mode)
+
         return self._tables
 
 
 class Table:
 
-    def __init__(self, path, name, state):
+    def __init__(self, path, name, mode):
         self.path = path
         self.name = name
-        self.state = state
+        self.mode = mode
 
         self._headings = []
         self._index = None
 
     def __getattr__(self, item):
-        if item not in dir(self):
-            if item in self.headings:
-                return self.read_field(item)
-            else:
-                print("Field {} not in {}".format(item, self.name))
+        if item in self.headings:
+            return self.read_field(item)
         else:
-            return getattr(self, item)
+            print("Field {} not in {}".format(item, self.name))
 
     @property
     def index(self):
         if not self._index:
-            self._index = IndexType()
             types = []
             for key in ("mukey", "cokey", "chkey"):
                 if key in self.headings:
@@ -154,19 +192,26 @@ class Table:
             if len(types) > 1:
                 print("Unable to identify an index for table {}".format(self.name))
             elif len(types) == 1:
-                self._index = IndexType(types.pop())
+                self._index = types.pop()
+            else:
+                self._index = "N/A"
         return self._index
+
 
     @property
     def headings(self):
         if not self._headings:
-            with open(self.path) as f:
-                self._headings = f.readline().strip().split(",")
+            if self.mode == "esri":
+                import arcpy
+                self._headings = {field.name for field in arcpy.ListFields(self.path)}
+            else:
+                with open(self.path) as f:
+                    self._headings = f.readline().strip().split(",")
         return self._headings
 
     @property
     def indexed(self):
-        if self.index.type == "not indexed":
+        if self.index == "N/A":
             return False
         else:
             return True
@@ -185,25 +230,30 @@ class Table:
         return out_dict
 
     def read_field(self, field_name):
-        with open(self.path) as f:
-            reader = csv.DictReader(f, has_header=True)
-            if field_name in reader.fieldnames and self.index in reader.fieldnames:
-                return {r[self.index]: r[field_name] for r in reader}
-            else:
-                print("Unable to match field \"{}\" to index \"{}\" in table \"{}\"".format(
-                    field_name, self.index, self.name))
 
-class IndexType:
-    def __init__(self, index_field="N/A"):
-        types = {"mukey": "map unit",
-                 "cokey": "component",
-                 "chkey": "horizon",
-                 "N/A": "not indexed"}.get(self.field)
-        self.field = index_field
-        if index_field not in types:
-            print("Invalid index field {}".format(index_field))
-            self.index_field = "N/A"
-        self.type = types[index_field]
+        def from_csv():
+            with open(self.path) as f:
+                reader = csv.DictReader(f)
+                if field_name in reader.fieldnames and self.index in reader.fieldnames:
+                    return {r[self.index]: r[field_name] for r in reader}
+
+        def from_gdb():
+            import arcpy
+            fields = {field.name for field in arcpy.ListFields(self.path)}
+            if field_name in fields and self.index in fields:
+                return dict(arcpy.da.SearchCursor(self.path, [self.index, field_name]))
+
+        if self.mode == "esri":
+            data = from_gdb()
+        else:
+            data = from_csv()
+
+        if data:
+            return data
+        else:
+            print("Unable to match field \"{}\" to index \"{}\" in table \"{}\"".format(
+                  field_name, self.index, self.name))
+
 
 
 def map_unit_average(data, component_map):
@@ -221,3 +271,10 @@ def map_unit_average(data, component_map):
         out_data += proportional_value
     return out_data
 
+def test():
+    #a = SSURGO(r'T:\SSURGO', 'esri')
+    b = SSURGO(r"T:\CustomSSURGO", 'streamline')
+    #print(a.ia.coecoclass.ecoclasstypename.values())
+    print(b.ia.coecoclass.ecoclasstypename.values())
+
+test()
