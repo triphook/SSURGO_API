@@ -218,15 +218,30 @@ class Table:
 
     def map_components(self, super_key, sub_key, third_key=None):
         out_dict = defaultdict(list)
-        with open(self.path) as f:
-            reader = csv.DictReader(f)
-            for line in reader:
-                super_val = int(line[super_key])
-                sub_val = int(line[sub_key])
-                if third_key:
-                    out_dict[super_val].append((sub_val, line[third_key]))
-                else:
-                    out_dict[super_val].append(sub_val)
+
+        def gdb_reader():
+            import arcpy
+            fields = sorted(self.headings)
+            for row in arcpy.da.SearchCursor(self.path, fields):
+                yield dict(zip(fields, row))
+
+        def csv_reader():
+            with open(self.path) as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    yield row
+
+        if self.mode == "esri":
+            iterator = gdb_reader()
+        else:
+            iterator = csv_reader()
+        for line in iterator:
+            super_val = int(line[super_key])
+            sub_val = int(line[sub_key])
+            if third_key:
+                out_dict[super_val].append((sub_val, line[third_key]))
+            else:
+                out_dict[super_val].append(sub_val)
         return out_dict
 
     def read_field(self, field_name):
@@ -259,9 +274,10 @@ class Table:
 def map_unit_average(data, component_map):
     """
     Converts component level data into map unit level data by taking an area-weighted average
-    :param data:
-    :param component_map:
-    :return:
+    :param data: A dictionary with component ids as keys and values as values
+    :param component_map: A dictionary with map unit as keys, and tuple of component id and area as values.
+                          Generated automatically by State.components
+    :return: A dictionary with map unit ids as keys and spatially averaged values as values
     """
     out_data = dict.fromkeys(component_map.keys(), 0.0)
     for map_unit, component in component_map.items():
@@ -271,10 +287,3 @@ def map_unit_average(data, component_map):
         out_data += proportional_value
     return out_data
 
-def test():
-    #a = SSURGO(r'T:\SSURGO', 'esri')
-    b = SSURGO(r"T:\CustomSSURGO", 'streamline')
-    #print(a.ia.coecoclass.ecoclasstypename.values())
-    print(b.ia.coecoclass.ecoclasstypename.values())
-
-test()
